@@ -1,0 +1,20 @@
+[package]
+name = "ffrwd-nut"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The NUT container ffrwd puts on its pipes: one demuxer behind a push parser and a blocking reader, and the muxer that writes what ffmpeg reads."
+
+[lib]
+name = "ffrwd_nut"
+
+[dependencies]
+# Nothing, for the format itself. The annotation stream carries JSON rows and
+# has to tell a whole record from the lines of one, which is a parser this
+# crate has no other use for; a consumer that wants that stream turns the
+# feature on and takes serde with it.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", features = ["raw_value"], optional = true }
+
+[features]
+annotations = ["dep:serde", "dep:serde_json"]
