@@ -247,6 +247,74 @@ fn an_aac_stream_ffmpeg_copied_off_adts_gets_its_config_derived() {
     assert!(packets > 0, "half a second of sine has packets in it");
 }
 
+#[test]
+fn a_stream_that_opens_before_zero_is_read_with_its_negative_clock() {
+    // Reordered pictures whose first pts is 0 have a first dts before it, and
+    // `-avoid_negative_ts disabled` keeps it there. ffmpeg's writer casts the
+    // signed syncpoint timestamp to unsigned on its way out, so the wire
+    // carries a two's complement pattern that an unsigned reader takes for
+    // about 1.8e19 ticks and refuses. ffprobe reads such a file; so does this.
+    if !ffmpeg_on_path() {
+        announce_skip("real ffmpeg cannot write a stream that opens before zero");
+        return;
+    }
+    let mkv = std::env::temp_dir().join(format!("ffrwd_nut_neg_{}.mkv", std::process::id()));
+    let nut = std::env::temp_dir().join(format!("ffrwd_nut_neg_{}.nut", std::process::id()));
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=160x120:rate=15:duration=2",
+        "-c:v",
+        "libx264",
+        "-bf",
+        "2",
+        "-g",
+        "15",
+        "-pix_fmt",
+        "yuv420p",
+        mkv.to_str().expect("a UTF-8 path"),
+    ]);
+    run_ffmpeg(&[
+        "-copyts",
+        "-i",
+        mkv.to_str().expect("a UTF-8 path"),
+        "-map",
+        "0:v:0",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "disabled",
+        "-f",
+        "nut",
+        nut.to_str().expect("a UTF-8 path"),
+    ]);
+    let wire = std::fs::read(&nut).expect("read the generated NUT");
+    let _ = std::fs::remove_file(&mkv);
+    let _ = std::fs::remove_file(&nut);
+
+    let mut demuxer = Demuxer::open(&wire[..]).expect("read the NUT headers");
+    let mut buf = Vec::new();
+    let mut packets = Vec::new();
+    while let Some(packet) = demuxer.read_packet(&mut buf).expect("read a NUT packet") {
+        packets.push(packet);
+    }
+    assert_eq!(packets.len(), 30, "two seconds at fifteen frames a second");
+    assert!(
+        packets.iter().all(|packet| packet.pts >= 0),
+        "no picture is shown before zero"
+    );
+    assert_eq!(
+        packets.iter().map(|packet| packet.pts).min(),
+        Some(0),
+        "the first picture shown is at zero"
+    );
+    let mut shown: Vec<i64> = packets.iter().map(|packet| packet.pts).collect();
+    shown.sort_unstable();
+    shown.dedup();
+    assert_eq!(shown.len(), 30, "every picture has a time of its own");
+}
+
 /// Runs ffmpeg over `args`, failing with its own account of what went wrong.
 fn run_ffmpeg(args: &[&str]) {
     let output = Command::new("ffmpeg")

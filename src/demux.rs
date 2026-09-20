@@ -713,9 +713,17 @@ impl PushDemuxer {
         let mut r = Cursor::new(body, 0);
         let coded = r.v()?;
         let _back_ptr = r.v()?;
-        let count = main.time_bases.len() as u64;
-        let from = main.time_bases[(coded % count) as usize];
-        let ticks = (coded / count) as i128;
+        // The field is `ticks * count + index` with ticks SIGNED: a writer
+        // casts to unsigned before the multiply, so a stream that opens
+        // before zero (a dts ahead of reordered pictures, under
+        // `-avoid_negative_ts disabled`) puts a two's complement pattern on
+        // the wire. Read back as signed, a floored divide and a modulus that
+        // is never negative take it apart again for any number of time
+        // bases, which is more than an unsigned divide can say.
+        let coded = coded as i64;
+        let count = main.time_bases.len() as i64;
+        let from = main.time_bases[coded.rem_euclid(count) as usize];
+        let ticks = i128::from(coded.div_euclid(count));
         for (index, stream) in self.streams.iter().enumerate() {
             let Some(stream) = stream else { continue };
             let to = stream.time_base;
