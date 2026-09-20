@@ -240,10 +240,21 @@ impl<W: Write> Muxer<W> {
         self.write_bytes(data)
     }
 
-    /// Flushes everything written so far.
-    pub fn finish(&mut self) -> Result<()> {
+    /// Hands everything written so far to the writer underneath and flushes
+    /// it. NUT has no trailer, so this ends nothing: a writer on a pipe calls
+    /// it after each batch of frames, because a reader cannot finish opening
+    /// the stream until the first syncpoint has reached it, and that rides
+    /// the first frame.
+    pub fn flush(&mut self) -> Result<()> {
         self.out.flush()?;
         Ok(())
+    }
+
+    /// The end of the stream, which for NUT is only a flush. Kept for callers
+    /// that mean "I am done"; [`Muxer::flush`] is the same thing said mid
+    /// stream.
+    pub fn finish(&mut self) -> Result<()> {
+        self.flush()
     }
 
     /// The writer underneath, once the stream is written.
