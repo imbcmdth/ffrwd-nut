@@ -10,8 +10,9 @@
 //! What is read: the main header (version, stream count, time bases, the
 //! framecode table, elision headers), the stream headers (fourcc, the
 //! geometry the class calls for, time base, pts coding, codec extradata),
-//! syncpoints, the `r_frame_rate` an info packet states, and frames with
-//! their coded PTS and keyframe flag. Index packets are stepped over, as is
+//! syncpoints, the `r_frame_rate` an info packet states and the string fields
+//! it carries (a stream's and a file's metadata, read with
+//! [`PushDemuxer::tags`]), and frames with their coded PTS and keyframe flag. Index packets are stepped over, as is
 //! any startcode this subset does not know.
 //!
 //! Payloads are opaque whichever kind the stream is: a video packet is a

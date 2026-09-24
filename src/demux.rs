@@ -37,6 +37,14 @@ const MAX_RESERVED_FIELDS: u64 = 256;
 /// The deepest frame reordering this crate carries. ffmpeg's own bound.
 const MAX_DECODE_DELAY: u64 = 16;
 
+/// The most string fields kept for one stream, or for the whole file. A field
+/// restated under a name already held replaces it and costs nothing; past
+/// this, a new name is read past, as an info packet's other fields are.
+const MAX_TAGS: usize = 64;
+
+/// A tag's name and value, as the wire spelled them.
+type Tag = (String, String);
+
 /// How much the demuxer will hold or hand over, for a stream whose lengths
 /// something else chose. Every one of these is a ceiling on an allocation the
 /// wire asks for, so a hostile length is refused by name instead of tried.
@@ -83,7 +91,9 @@ pub struct MainHeader {
 
 /// What an info packet said that this crate understands. Everything else in
 /// one is read past: an info packet is advisory, and a writer may put
-/// anything in it.
+/// anything in it. The string fields it carries, which is where ffmpeg puts a
+/// stream's and a file's metadata, are kept on the demuxer and read with
+/// [`PushDemuxer::tags`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Info {
     /// The stream it was written against, or None for the whole file.
@@ -200,6 +210,10 @@ pub struct PushDemuxer {
     main: Option<Tables>,
     stream_count: usize,
     streams: Vec<Option<Stream>>,
+    /// The string fields info packets stated, per stream and for the whole
+    /// file.
+    stream_tags: Vec<Vec<Tag>>,
+    file_tags: Vec<Tag>,
     clocks: Vec<Clock>,
     /// The per-stream frame ceilings a caller set, which may arrive before
     /// the streams do.
@@ -225,6 +239,8 @@ impl PushDemuxer {
             streams: Vec::new(),
             clocks: Vec::new(),
             ceilings: Vec::new(),
+            stream_tags: Vec::new(),
+            file_tags: Vec::new(),
             headers_done: false,
             payload: Vec::new(),
         }
@@ -283,6 +299,23 @@ impl PushDemuxer {
     /// One stream's header, once it has arrived.
     pub fn stream(&self, index: usize) -> Option<&Stream> {
         self.streams.get(index).and_then(Option::as_ref)
+    }
+
+    /// The string fields the info packets read so far stated about one
+    /// stream, or about the whole file for None, in the order their names
+    /// first arrived. This is where ffmpeg's metadata travels: `-metadata:s:v
+    /// name=value` is `("name", "value")` on the video stream and `-metadata
+    /// name=value` the same on the file. ffmpeg writes its info packets
+    /// after the stream headers and before the first syncpoint, so all of
+    /// them are here by [`Event::EndOfHeaders`]. A header section restated
+    /// mid-stream restates them too, and a name stated again replaces its
+    /// value rather than adding a second one. A stream not declared, or with
+    /// nothing stated, has none.
+    pub fn tags(&self, stream: Option<usize>) -> &[Tag] {
+        match stream {
+            None => &self.file_tags,
+            Some(index) => self.stream_tags.get(index).map_or(&[], Vec::as_slice),
+        }
     }
 
     /// The payload of the frame [`Event::Frame`] just announced. It stands
@@ -529,7 +562,10 @@ impl PushDemuxer {
                 }
                 Some(Event::Syncpoint)
             }
-            _ => read_info(body).map(Event::Info),
+            _ => read_info(body).map(|(info, tags)| {
+                self.apply_tags(info.stream, tags);
+                Event::Info(info)
+            }),
         };
         if let Some(Event::Info(info)) = &event {
             self.apply_info(*info);
@@ -603,6 +639,10 @@ impl PushDemuxer {
         // consumer that refuses a restatement does it on the event.
         if self.stream_count != stream_count {
             self.streams = vec![None; stream_count];
+            // Another set of streams is another file as far as what was
+            // said about them goes.
+            self.stream_tags = vec![Vec::new(); stream_count];
+            self.file_tags.clear();
             self.clocks = Vec::new();
             for _ in 0..stream_count {
                 self.clocks.push(Clock {
@@ -750,6 +790,26 @@ impl PushDemuxer {
                 for stream in self.streams.iter_mut().flatten() {
                     stream.frame_rate = Some(rate);
                 }
+            }
+        }
+    }
+
+    /// The string fields an info packet stated, onto the stream it named or
+    /// the whole file. One naming a stream the main header did not declare is
+    /// dropped, as its frame rate is.
+    fn apply_tags(&mut self, stream: Option<usize>, tags: Vec<Tag>) {
+        let held = match stream {
+            None => &mut self.file_tags,
+            Some(index) => match self.stream_tags.get_mut(index) {
+                Some(held) => held,
+                None => return,
+            },
+        };
+        for (name, value) in tags {
+            if let Some(slot) = held.iter_mut().find(|(had, _)| *had == name) {
+                slot.1 = value;
+            } else if held.len() < MAX_TAGS {
+                held.push((name, value));
             }
         }
     }
@@ -1107,11 +1167,13 @@ fn read_frame_codes(r: &mut Cursor<'_>) -> Parse<Box<[FrameCode; 256]>> {
 }
 
 /// What an info packet says. It holds named fields, each a name and a value
-/// whose type the leading signed integer picks; -1 is the UTF-8 string
-/// `r_frame_rate` is written as, and every other type is read past. A field
-/// this cannot parse is not an error: an info packet is advisory, and a
-/// writer may put anything in one.
-fn read_info(body: &[u8]) -> Option<Info> {
+/// whose type the leading signed integer picks; -1 is a UTF-8 string, which
+/// is how ffmpeg writes `r_frame_rate` and every metadata field, and -2 a
+/// named type whose value is a string too. Both are kept as tags; every other
+/// type is read past. A field this cannot parse is not an error: an info
+/// packet is advisory, and a writer may put anything in one. A name or a
+/// value that is not UTF-8 is not kept.
+fn read_info(body: &[u8]) -> Option<(Info, Vec<Tag>)> {
     let mut r = Cursor::new(body, 0);
     let stream_id_plus1 = r.v().ok()?;
     let _chapter_id = r.s().ok()?;
@@ -1119,6 +1181,7 @@ fn read_info(body: &[u8]) -> Option<Info> {
     let _chapter_len = r.v().ok()?;
     let count = r.v().ok()?;
     let mut frame_rate = None;
+    let mut tags = Vec::new();
     for _ in 0..count.min(64) {
         let name = r.vb("an info field name").ok()?;
         let kind = r.s().ok()?;
@@ -1143,13 +1206,17 @@ fn read_info(body: &[u8]) -> Option<Info> {
         if name == b"r_frame_rate" {
             frame_rate = read_rate(&value);
         }
+        if let (Ok(name), Ok(value)) = (String::from_utf8(name), String::from_utf8(value)) {
+            tags.push((name, value));
+        }
     }
-    Some(Info {
+    let info = Info {
         stream: stream_id_plus1
             .checked_sub(1)
             .and_then(|index| usize::try_from(index).ok()),
         frame_rate,
-    })
+    };
+    Some((info, tags))
 }
 
 /// `num/den` as an info packet spells a frame rate. Both have to be positive

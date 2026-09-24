@@ -16,6 +16,13 @@
 //!        -f lavfi -i sine=frequency=440:sample_rate=48000:duration=0.4 \
 //!        -c:v rawvideo -pix_fmt yuv420p -c:a pcm_s16le -f nut tests/av.nut
 //! ```
+//!
+//! `tagged.nut` is `av.nut`'s shape with metadata on the video stream and on
+//! the file, which ffmpeg writes as info packets:
+//!
+//! ```text
+//! ffmpeg -f lavfi -i testsrc2=size=32x24:rate=10:duration=0.3 //!        -f lavfi -i sine=frequency=440:sample_rate=48000:duration=0.3 //!        -c:v rawvideo -pix_fmt yuv420p -c:a pcm_s16le //!        -metadata:s:v smart_timed=1 -metadata title=tagged -f nut tests/tagged.nut
+//! ```
 
 use ffrwd_nut::{Demuxer, Event, Limits, Media, PushDemuxer, TimeBase};
 
@@ -24,6 +31,9 @@ const H264: &[u8] = include_bytes!("h264.nut");
 
 /// Raw yuv420p video and interleaved pcm, the two streams a feeder sends.
 const AV: &[u8] = include_bytes!("av.nut");
+
+/// The same two streams, with metadata on the video stream and the file.
+const TAGGED: &[u8] = include_bytes!("tagged.nut");
 
 const MAIN_STARTCODE: u64 = 0x4E4D_7A56_1F5F_04AD;
 const STREAM_STARTCODE: u64 = 0x4E53_1140_5BF2_F9DB;
@@ -114,7 +124,7 @@ fn scattered(seed: u32, count: usize) -> Vec<usize> {
 
 #[test]
 fn how_the_bytes_arrive_changes_nothing() {
-    for (name, wire) in [("h264", H264), ("av", AV)] {
+    for (name, wire) in [("h264", H264), ("av", AV), ("tagged", TAGGED)] {
         let whole = read_in(wire, &[wire.len()]).expect("the whole wire parses");
         assert!(
             !frames(&whole).is_empty(),
@@ -261,9 +271,157 @@ fn the_frame_rate_an_info_packet_states_reaches_the_stream() {
     );
 }
 
+/// The value one scope's tags give a name, if any.
+fn tag<'a>(core: &'a PushDemuxer, stream: Option<usize>, name: &str) -> Option<&'a str> {
+    core.tags(stream)
+        .iter()
+        .find(|(had, _)| had == name)
+        .map(|(_, value)| value.as_str())
+}
+
+#[test]
+fn metadata_ffmpeg_writes_is_there_by_the_end_of_the_headers() {
+    // A byte at a time, so the check at `EndOfHeaders` is of what had been
+    // read by then and not of a wire already parsed to the end.
+    let mut core = PushDemuxer::new(Limits::default());
+    let mut checked = false;
+    for byte in TAGGED {
+        core.feed(&[*byte]);
+        while let Some(event) = core.next_event().expect("the fixture parses") {
+            if event == Event::EndOfHeaders {
+                assert_eq!(tag(&core, Some(0), "smart_timed"), Some("1"));
+                assert_eq!(tag(&core, None, "title"), Some("tagged"));
+                assert_eq!(
+                    tag(&core, Some(1), "smart_timed"),
+                    None,
+                    "a stream's metadata is that stream's"
+                );
+                assert_eq!(tag(&core, None, "smart_timed"), None);
+                checked = true;
+            }
+        }
+    }
+    assert!(checked, "the header section ended");
+}
+
+#[test]
+fn a_wire_with_no_metadata_of_its_own_has_none_of_it() {
+    let mut core = PushDemuxer::new(Limits::default());
+    core.feed(AV);
+    core.finish();
+    drain(&mut core, &mut Vec::new()).expect("the fixture parses");
+    for scope in [None, Some(0), Some(1)] {
+        assert_eq!(tag(&core, scope, "smart_timed"), None);
+    }
+    // What ffmpeg always writes is still read: the frame rate is a string
+    // field like any other.
+    assert_eq!(tag(&core, Some(0), "r_frame_rate"), Some("10/1"));
+    assert!(
+        core.tags(Some(7)).is_empty(),
+        "an undeclared stream has none"
+    );
+}
+
+/// An info packet holding string fields, against one stream or the file.
+fn info(stream: Option<u64>, fields: &[(&str, &str)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    write::v(&mut body, stream.map_or(0, |index| index + 1));
+    write::s(&mut body, 0); // chapter id
+    write::v(&mut body, 0); // chapter start
+    write::v(&mut body, 0); // chapter length
+    write::v(&mut body, fields.len() as u64);
+    for (name, value) in fields {
+        write::vb(&mut body, name.as_bytes());
+        write::s(&mut body, -1);
+        write::vb(&mut body, value.as_bytes());
+    }
+    let mut out = Vec::new();
+    write::packet(&mut out, INFO_STARTCODE, &body);
+    out
+}
+
+#[test]
+fn a_name_stated_again_replaces_its_value_rather_than_adding_one() {
+    let mut wire = opening(4, 4);
+    wire.extend(info(Some(0), &[("smart_timed", "0"), ("lang", "en")]));
+    wire.extend(info(Some(0), &[("smart_timed", "1")]));
+    wire.extend(info(None, &[("title", "a")]));
+    // A stream the main header does not declare.
+    wire.extend(info(Some(5), &[("smart_timed", "1")]));
+    wire.extend(syncpoint(0, 0));
+    wire.extend(frame(0, 0, &[1u8; 24]));
+    // ffmpeg's restatement, saying the same again.
+    wire.extend(main_header());
+    wire.extend(video_header(4, 4));
+    wire.extend(audio_header(48_000, 2));
+    wire.extend(info(Some(0), &[("smart_timed", "1")]));
+    wire.extend(frame(0, 1, &[2u8; 24]));
+
+    let mut core = PushDemuxer::new(Limits::default());
+    core.feed(&wire);
+    core.finish();
+    drain(&mut core, &mut Vec::new()).expect("the wire parses");
+    assert_eq!(
+        core.tags(Some(0)),
+        &[
+            ("smart_timed".to_string(), "1".to_string()),
+            ("lang".to_string(), "en".to_string()),
+        ]
+    );
+    assert_eq!(core.tags(None), &[("title".to_string(), "a".to_string())]);
+    assert!(core.tags(Some(1)).is_empty());
+    assert!(core.tags(Some(5)).is_empty());
+}
+
+#[test]
+fn a_stream_holds_a_bounded_number_of_names() {
+    let names: Vec<String> = (0..200).map(|i| format!("name{i}")).collect();
+    let fields: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "x")).collect();
+    let mut wire = opening(4, 4);
+    // An info packet reads at most 64 fields; several of them try for more.
+    for chunk in fields.chunks(50) {
+        wire.extend(info(Some(0), chunk));
+    }
+    wire.extend(syncpoint(0, 0));
+    wire.extend(frame(0, 0, &[1u8; 24]));
+
+    let mut core = PushDemuxer::new(Limits::default());
+    core.feed(&wire);
+    core.finish();
+    let mut events = Vec::new();
+    drain(&mut core, &mut events).expect("the wire parses");
+    assert_eq!(frames(&events).len(), 1);
+    assert_eq!(core.tags(Some(0)).len(), 64);
+    assert_eq!(tag(&core, Some(0), "name0"), Some("x"));
+    assert_eq!(tag(&core, Some(0), "name64"), None);
+}
+
+#[test]
+fn a_different_set_of_streams_forgets_what_was_said_about_the_last() {
+    let mut wire = ffrwd_nut::FILE_ID.to_vec();
+    wire.extend(main_header_for(1));
+    wire.extend(video_header(4, 4));
+    wire.extend(info(Some(0), &[("smart_timed", "1")]));
+    wire.extend(info(None, &[("title", "first")]));
+    wire.extend(syncpoint(0, 0));
+    wire.extend(frame(0, 0, &[1u8; 24]));
+    wire.extend(main_header());
+    wire.extend(video_header(4, 4));
+    wire.extend(audio_header(48_000, 2));
+    wire.extend(syncpoint(0, 0));
+    wire.extend(frame(0, 1, &[2u8; 24]));
+
+    let mut core = PushDemuxer::new(Limits::default());
+    core.feed(&wire);
+    core.finish();
+    drain(&mut core, &mut Vec::new()).expect("the wire parses");
+    assert!(core.tags(Some(0)).is_empty());
+    assert!(core.tags(None).is_empty());
+}
+
 #[test]
 fn the_header_section_ends_once_and_before_the_first_frame() {
-    for wire in [H264, AV] {
+    for wire in [H264, AV, TAGGED] {
         let events = read_in(wire, &[64]).expect("the fixture parses");
         let ends: Vec<usize> = events
             .iter()
@@ -282,7 +440,7 @@ fn the_header_section_ends_once_and_before_the_first_frame() {
 
 #[test]
 fn every_truncation_asks_for_more_rather_than_erroring() {
-    for wire in [H264, AV] {
+    for wire in [H264, AV, TAGGED] {
         for cut in 0..wire.len() {
             let mut core = PushDemuxer::new(Limits::default());
             core.feed(&wire[..cut]);

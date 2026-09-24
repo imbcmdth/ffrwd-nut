@@ -70,6 +70,18 @@ It goes out with the headers rather than later because a reader that
 learns the rate after the fact has already handed out packets without
 it.
 
+## Metadata
+
+ffmpeg writes a stream's metadata (`-metadata:s:v name=value`) and the
+file's (`-metadata name=value`) as info packets between the stream
+headers and the first syncpoint. `PushDemuxer::tags(Some(index))` and
+`PushDemuxer::tags(None)` hand back the string fields those packets
+stated, as `(name, value)` pairs in the order the names first arrived,
+and all of them are there by `EndOfHeaders`. A header section restated
+mid-stream states them again, and a name stated again replaces its value
+rather than adding a second one. Fields of any other type are read past,
+and so is a new name once a stream already holds 64.
+
 ## What it does not do
 
 Version 4 is refused by number rather than half read: it adds per-frame
