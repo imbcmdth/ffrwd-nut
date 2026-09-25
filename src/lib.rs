@@ -118,6 +118,14 @@ pub const AUDIO_CLASS: u64 = 1;
 pub const SUBTITLE_CLASS: u64 = 2;
 pub const DATA_CLASS: u64 = 3;
 
+/// The codec tag on a data stream of JSON messages: one packet per message,
+/// its payload one UTF-8 JSON object, its PTS the moment the message belongs
+/// to. Unlike the annotation stream this is a stream in its own right, the
+/// one stream of a wire like any video or audio stream. ffmpeg has no codec
+/// for the tag and needs none: it carries the stream through NUT and copies
+/// it as it is.
+pub const JSON_FOURCC: &[u8; 4] = b"JSON";
+
 /// Frame flags, as they appear in the framecode table and in a frame's own
 /// `coded_flags`.
 pub mod flags {

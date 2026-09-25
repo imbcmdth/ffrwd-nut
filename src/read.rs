@@ -12,7 +12,7 @@ use std::io::{ErrorKind, Read};
 
 use crate::demux::{Event, Limits, PushDemuxer};
 use crate::error::{bail, Error, Result};
-use crate::{adts, Media, Packet, Stream, AUDIO_CLASS, VIDEO_CLASS};
+use crate::{adts, Media, Packet, Stream, AUDIO_CLASS, DATA_CLASS, JSON_FOURCC, VIDEO_CLASS};
 #[cfg(feature = "annotations")]
 use crate::{ANNOTATION_CLASS, ANNOTATION_FOURCC, ANNOTATION_STREAM_ID, TRAILING_KEY};
 
@@ -314,13 +314,18 @@ impl<R: Read> Demuxer<R> {
 }
 
 /// The one media stream this wire carries has to be one whose geometry the
-/// stream header describes.
+/// stream header describes, or a data stream of JSON messages, which needs
+/// none.
 fn check_media(stream: &Stream) -> Result<()> {
     match stream.media {
         Media::Video { .. } | Media::Audio { .. } => Ok(()),
+        Media::Other { .. } if stream.is_json() => Ok(()),
         Media::Other { class } => Err(Error::unsupported(format!(
-            "NUT input carries stream class {class}; this wire carries video (class \
-             {VIDEO_CLASS}) and audio (class {AUDIO_CLASS})"
+            "NUT input carries stream class {class} codec {}; this wire carries video (class \
+             {VIDEO_CLASS}), audio (class {AUDIO_CLASS}) and JSON messages (class \
+             {DATA_CLASS}, codec {})",
+            stream.fourcc_name(),
+            String::from_utf8_lossy(JSON_FOURCC)
         ))),
     }
 }

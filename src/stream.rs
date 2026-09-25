@@ -1,6 +1,6 @@
 //! What a stream header says, and the codec tags this wire carries.
 
-use crate::{AUDIO_CLASS, DATA_CLASS, SUBTITLE_CLASS, VIDEO_CLASS};
+use crate::{AUDIO_CLASS, DATA_CLASS, JSON_FOURCC, SUBTITLE_CLASS, VIDEO_CLASS};
 
 /// The unit PTS are counted in, as a rational number of seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +159,28 @@ impl Stream {
         })
     }
 
+    /// A data stream of JSON messages; see [`JSON_FOURCC`]. Messages are
+    /// sparse, so the time base is whatever the caller counts them in -
+    /// microseconds, say - and a jump between two of them codes its PTS in
+    /// full.
+    pub fn json(time_base: TimeBase) -> Stream {
+        Stream {
+            fourcc: JSON_FOURCC.to_vec(),
+            time_base,
+            msb_pts_shift: 14,
+            max_pts_distance: time_base.den.div_ceil(time_base.num.max(1)),
+            decode_delay: 0,
+            extradata: Vec::new(),
+            frame_rate: None,
+            media: Media::Other { class: DATA_CLASS },
+        }
+    }
+
+    /// Whether this is a data stream of JSON messages.
+    pub fn is_json(&self) -> bool {
+        self.media == (Media::Other { class: DATA_CLASS }) && self.fourcc == JSON_FOURCC
+    }
+
     /// The NUT stream class this stream's media is written as.
     pub fn class(&self) -> u64 {
         match self.media {
@@ -177,13 +199,13 @@ impl Stream {
     }
 
     /// ffmpeg's name for the coded codec the tag names, from the table for
-    /// this stream's own kind. None for a raw stream and for any codec this
-    /// wire does not carry.
+    /// this stream's own kind, or `json` for a data stream of JSON messages.
+    /// None for a raw stream and for any codec this wire does not carry.
     pub fn codec_name(&self) -> Option<&'static str> {
         let table = match self.media {
             Media::Video { .. } => CODED_VIDEO_FOURCCS,
             Media::Audio { .. } => CODED_AUDIO_FOURCCS,
-            Media::Other { .. } => return None,
+            Media::Other { .. } => return self.is_json().then_some("json"),
         };
         table
             .iter()
