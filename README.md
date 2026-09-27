@@ -57,6 +57,30 @@ through a reorder buffer of `decode_delay + 1` entries. Hand them over
 in presentation order and the dts that come out the other end are
 wrong, which is the one mistake this interface cannot catch for you.
 
+## Codecs with no name here
+
+h264, hevc, av1 and aac are known by name, under the tags ffmpeg gives
+them in NUT. Any other codec rides the same way under a tag of its own:
+`Stream::coded_fourcc("video", b"PYRW", (width, height), time_base,
+extradata, decode_delay)` builds the header (for audio the pair is the
+rate and the channel count), `write_coded` writes its packets, and a
+reader gets `codec_name() == Some("PYRW")` back. The tag has to be four
+printable ASCII bytes, since its text is the codec's name. A video or
+audio tag that no table names and this crate does not carry raw is read
+the same way, so a raw format this wire has no name for (`Y42B`, say)
+reads as a coded stream of that name.
+
+ffmpeg has no decoder for such a tag and needs none to copy it. Its NUT
+demuxer logs `Unknown codec tag` and carries on, and `-c copy -f nut`
+hands every packet, keyframe flag and the extradata through unchanged.
+It does pick its own time base on the way out (1/61440 for a 1/30
+input), so the pts come back as the same instants counted in other
+ticks. A stream that reorders comes back later by its decode delay
+unless the copy is given `-avoid_negative_ts disabled`, as an h264 one
+does. Copied to mkv the stream is written as `V_MS/VFW/FOURCC` with
+its timestamps rounded to milliseconds; mp4 refuses it outright.
+`tests/ffmpeg.rs` runs all of this against the ffmpeg on PATH.
+
 ## Why the frame rate is written down
 
 NUT has no per-frame duration field. A reader can subtract one packet's

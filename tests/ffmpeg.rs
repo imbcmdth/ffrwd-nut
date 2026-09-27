@@ -17,7 +17,12 @@ const H264: &[u8] = include_bytes!("h264.nut");
 /// Whether ffmpeg is on PATH, so the tests that shell out to it can skip
 /// rather than fail where it is not installed.
 fn ffmpeg_on_path() -> bool {
-    Command::new("ffmpeg")
+    on_path("ffmpeg")
+}
+
+/// Whether `tool` runs, answering `-version`.
+fn on_path(tool: &str) -> bool {
+    Command::new(tool)
         .arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -313,6 +318,163 @@ fn a_stream_that_opens_before_zero_is_read_with_its_negative_clock() {
     shown.sort_unstable();
     shown.dedup();
     assert_eq!(shown.len(), 30, "every picture has a time of its own");
+}
+
+#[test]
+fn a_codec_ffmpeg_has_no_name_for_crosses_its_nut_demuxer_and_muxer_untouched() {
+    // A stream under a tag no table names, as an encoder module in a codec
+    // package writes it: `PYRW`, a few packets of opaque bytes, keyframes
+    // where the encoder says. ffmpeg has no decoder for the tag and needs
+    // none to copy it, which is what decides whether an ffmpeg may sit
+    // between that encoder and the output file.
+    //
+    // What ffmpeg 9.0.1 did, for the record: its NUT demuxer logs `Unknown
+    // codec tag '0x57525950' for stream number 0` and `read_timestamp
+    // failed.` at error level and carries on; ffprobe reports
+    // codec_name=unknown, codec_tag_string=PYRW, the geometry, the time
+    // base and the extradata size. `-c copy -f nut` carries every packet,
+    // keyframe flag and the extradata through, and restates the time base
+    // as 1/61440 (the input's, doubled until it passes 48000), so the pts
+    // come back as the same instants in other ticks. `-c copy` to mkv
+    // logs `codec none is not supported by this format` and writes it
+    // anyway, as V_MS/VFW/FOURCC with the tag in a BITMAPINFOHEADER and
+    // timestamps rounded to milliseconds; to mp4 it fails with `Could not
+    // find tag for codec none in stream #0, codec not currently supported in
+    // container`. The last two are printed rather than asserted: what an
+    // ffmpeg build makes of them is its business, not this crate's.
+    if !ffmpeg_on_path() || !on_path("ffprobe") {
+        announce_skip("real ffmpeg and ffprobe cannot copy a stream under an unnamed tag");
+        return;
+    }
+    let dir = std::env::temp_dir();
+    let name = |ext: &str| dir.join(format!("ffrwd_nut_pyrw_{}.{ext}", std::process::id()));
+    let (x, y, mkv, mp4) = (name("x.nut"), name("y.nut"), name("mkv"), name("mp4"));
+    let path = |p: &std::path::PathBuf| p.to_str().expect("a UTF-8 path").to_string();
+
+    let mut stream = Stream::coded_fourcc(
+        "video",
+        b"PYRW",
+        (64, 48),
+        TimeBase { num: 1, den: 30 },
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+        0,
+    )
+    .expect("PYRW is four printable bytes");
+    stream.frame_rate = Some((30, 1));
+    let packets: Vec<(Packet, Vec<u8>)> = (0..6i64)
+        .map(|index| {
+            let packet = Packet {
+                pts: index,
+                dts: Some(index),
+                keyframe: index % 3 == 0,
+            };
+            (packet, vec![0xA0 + index as u8; 100 + index as usize])
+        })
+        .collect();
+    let mut wire = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+        for (packet, data) in &packets {
+            muxer.write_coded(packet, data).expect("write coded packet");
+        }
+        muxer.finish().expect("finish");
+    }
+    std::fs::write(&x, &wire).expect("write the NUT file");
+
+    // (a) What ffprobe makes of the header.
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name,codec_tag_string,width,height,time_base,extradata_size",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(&x)
+        .output()
+        .expect("spawn ffprobe");
+    assert!(
+        probe.status.success(),
+        "ffprobe exited with {:?}",
+        probe.status.code()
+    );
+    let fields = String::from_utf8_lossy(&probe.stdout);
+    eprintln!("ffprobe:\n{fields}");
+    for expected in [
+        "codec_tag_string=PYRW",
+        "width=64",
+        "height=48",
+        "time_base=1/30",
+        "extradata_size=8",
+    ] {
+        assert!(
+            fields.lines().any(|line| line == expected),
+            "ffprobe did not say {expected}:\n{fields}"
+        );
+    }
+
+    // (b) NUT to NUT, read back by this crate.
+    let copied = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&x)
+        .args(["-c", "copy", "-f", "nut"])
+        .arg(&y)
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(
+        copied.status.success(),
+        "ffmpeg NUT to NUT exited with {:?}\nstderr:\n{}",
+        copied.status.code(),
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    let copy = std::fs::read(&y).expect("read ffmpeg's NUT");
+    let mut demuxer = Demuxer::open(&copy[..]).expect("read ffmpeg's NUT headers");
+    let got = demuxer.stream().clone();
+    assert_eq!(got.codec_name(), Some("PYRW"));
+    assert_eq!(got.extradata, stream.extradata);
+    assert_eq!(got.media, stream.media);
+    assert_eq!(got.decode_delay, 0);
+    assert_eq!(got.frame_rate, Some((30, 1)));
+    let mut buf = Vec::new();
+    let mut read = Vec::new();
+    while let Some(packet) = demuxer.read_packet(&mut buf).expect("read a packet") {
+        read.push((packet, buf.clone()));
+    }
+    assert_eq!(read.len(), packets.len());
+    let (from, to) = (stream.time_base, got.time_base);
+    for (index, ((sent, data), (came, bytes))) in packets.iter().zip(&read).enumerate() {
+        assert_eq!(bytes, data, "packet {index} bytes");
+        assert_eq!(came.keyframe, sent.keyframe, "packet {index} keyframe");
+        // The same instant, in whichever time base ffmpeg chose.
+        assert_eq!(
+            i128::from(came.pts) * i128::from(to.num) * i128::from(from.den),
+            i128::from(sent.pts) * i128::from(from.num) * i128::from(to.den),
+            "packet {index} pts {} in {to:?} against {} in {from:?}",
+            came.pts,
+            sent.pts
+        );
+    }
+
+    // (c) mkv and mp4, recorded rather than asserted.
+    for out in [&mkv, &mp4] {
+        let result = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "warning", "-y", "-i"])
+            .arg(&x)
+            .args(["-c", "copy"])
+            .arg(out)
+            .output()
+            .expect("spawn ffmpeg");
+        eprintln!(
+            "ffmpeg -c copy {}: exit {:?}\n{}",
+            path(out),
+            result.status.code(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    for file in [&x, &y, &mkv, &mp4] {
+        let _ = std::fs::remove_file(file);
+    }
 }
 
 /// Runs ffmpeg over `args`, failing with its own account of what went wrong.

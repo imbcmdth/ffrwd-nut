@@ -3,9 +3,12 @@
 //! Raw frames cannot carry a timestamp; NUT can, ffmpeg reads and writes it
 //! natively on a pipe, and it costs a few dozen bytes per frame. Only the
 //! subset that goes on those pipes is implemented: NUT version 3, carrying
-//! uncompressed video frames, interleaved pcm, or the encoded packets of
-//! [`CODED_VIDEO_FOURCCS`] and [`CODED_AUDIO_FOURCCS`]. Anything else is
-//! refused by name rather than guessed at.
+//! uncompressed video frames, interleaved pcm, or encoded packets. The codecs
+//! [`CODED_VIDEO_FOURCCS`] and [`CODED_AUDIO_FOURCCS`] name are known by
+//! ffmpeg's names for them; any other codec tag of four printable ASCII bytes
+//! is carried as it is and named by its own text (see
+//! [`Stream::coded_fourcc`]). Anything else is refused by name rather than
+//! guessed at.
 //!
 //! What is read: the main header (version, stream count, time bases, the
 //! framecode table, elision headers), the stream headers (fourcc, the

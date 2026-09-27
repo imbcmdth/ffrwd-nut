@@ -261,11 +261,20 @@ mod wire {
     }
 
     #[test]
-    fn an_audio_tag_this_wire_does_not_carry_names_no_codec() {
+    fn an_audio_tag_no_table_names_is_named_by_its_own_text() {
         let mut stream = an_aac_stream();
         stream.fourcc = b"OPUS".to_vec();
-        assert_eq!(stream.codec_name(), None);
+        assert_eq!(stream.codec_name(), Some("OPUS"));
         assert_eq!(stream.fourcc_name(), "OPUS");
+    }
+
+    #[test]
+    fn a_tag_that_is_not_four_printable_bytes_names_no_codec() {
+        let mut stream = an_aac_stream();
+        for tag in [&b"PSD\x18"[..], b"OPU", b"OPUSS", b"\xfe\x00\x00\x00"] {
+            stream.fourcc = tag.to_vec();
+            assert_eq!(stream.codec_name(), None, "{tag:?}");
+        }
     }
 
     #[test]
@@ -273,6 +282,135 @@ mod wire {
         let mut stream = an_aac_stream();
         stream.fourcc = b"H264".to_vec();
         assert_eq!(stream.codec_name(), None);
+    }
+
+    #[test]
+    fn a_raw_tag_names_no_codec() {
+        let rgba = Stream::video("rgba", 8, 8, TimeBase { num: 1, den: 25 }).expect("rgba");
+        assert_eq!(rgba.codec_name(), None);
+        let f32 = Stream::audio("f32", 48000, 2).expect("f32");
+        assert_eq!(f32.codec_name(), None, "`PFD ` is printable, and raw");
+    }
+
+    fn a_pyrw_stream() -> Stream {
+        Stream::coded_fourcc(
+            "video",
+            b"PYRW",
+            (64, 48),
+            TimeBase { num: 1, den: 30 },
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            0,
+        )
+        .expect("PYRW is four printable bytes")
+    }
+
+    #[test]
+    fn coded_fourcc_builds_a_stream_named_by_its_tag() {
+        let stream = a_pyrw_stream();
+        assert_eq!(stream.fourcc, b"PYRW");
+        assert_eq!(stream.codec_name(), Some("PYRW"));
+        assert_eq!(stream.pix_fmt(), None);
+        assert_eq!(stream.kind(), "video");
+        assert_eq!(stream.video_geometry(), Some((64, 48)));
+        assert_eq!(stream.extradata, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let audio = Stream::coded_fourcc(
+            "audio",
+            b"Opus",
+            (48000, 2),
+            TimeBase { num: 1, den: 48000 },
+            Vec::new(),
+            0,
+        )
+        .expect("Opus is four printable bytes");
+        assert_eq!(audio.codec_name(), Some("Opus"));
+        assert_eq!(audio.audio_geometry(), Some((48000, 2)));
+        assert_eq!(audio.time_base, TimeBase { num: 1, den: 48000 });
+    }
+
+    #[test]
+    fn coded_fourcc_builds_a_named_stream_under_its_tag() {
+        let stream = Stream::coded_fourcc(
+            "video",
+            b"H264",
+            (16, 16),
+            TimeBase { num: 1, den: 25 },
+            Vec::new(),
+            2,
+        )
+        .expect("H264 is a coded video tag");
+        assert_eq!(stream.codec_name(), Some("h264"));
+        assert_eq!(stream.decode_delay, 2);
+    }
+
+    #[test]
+    fn coded_fourcc_refuses_what_is_not_a_coded_tag() {
+        let tb = TimeBase { num: 1, den: 30 };
+        let build =
+            |kind: &str, tag: &[u8]| Stream::coded_fourcc(kind, tag, (64, 48), tb, Vec::new(), 0);
+        assert_eq!(build("video", b"PYR"), None, "three bytes");
+        assert_eq!(build("video", b"PYRWX"), None, "five bytes");
+        assert_eq!(build("video", b"PYR\x00"), None, "a control byte");
+        assert_eq!(build("video", b"PYR\xc3"), None, "not ASCII");
+        assert_eq!(build("video", b"RGBA"), None, "carried raw");
+        assert_eq!(build("audio", b"PFD "), None, "carried raw");
+        assert_eq!(build("audio", b"H264"), None, "the video table's");
+        assert_eq!(build("data", b"PYRW"), None, "not a kind");
+    }
+
+    #[test]
+    fn an_unnamed_coded_stream_survives_a_round_trip() {
+        let mut stream = a_pyrw_stream();
+        stream.decode_delay = 1;
+        stream.frame_rate = Some((30, 1));
+        // Decode order with one frame of reordering: I0 P2 B1 I3 P5 B4.
+        let packets: Vec<(i64, bool)> = vec![
+            (0, true),
+            (2, false),
+            (1, false),
+            (3, true),
+            (5, false),
+            (4, false),
+        ];
+        let mut wire = Vec::new();
+        {
+            let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+            assert!(
+                muxer.write_frame(0, &[0]).is_err(),
+                "a coded stream is not written as raw frames"
+            );
+            for (index, (pts, keyframe)) in packets.iter().enumerate() {
+                let packet = Packet {
+                    pts: *pts,
+                    dts: None,
+                    keyframe: *keyframe,
+                };
+                muxer
+                    .write_coded(&packet, &vec![index as u8; 10 + index])
+                    .expect("write coded packet");
+            }
+            muxer.finish().expect("finish");
+        }
+
+        let mut demuxer =
+            Demuxer::open(Cursor::new(wire)).expect("an unnamed codec is not refused");
+        assert_eq!(
+            demuxer.stream(),
+            &stream,
+            "the header comes back as written"
+        );
+        assert_eq!(demuxer.stream().codec_name(), Some("PYRW"));
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        while let Some(packet) = demuxer.read_packet(&mut buf).expect("read packet") {
+            got.push((packet.pts, packet.keyframe, buf.clone()));
+        }
+        let expected: Vec<(i64, bool, Vec<u8>)> = packets
+            .iter()
+            .enumerate()
+            .map(|(index, (pts, keyframe))| (*pts, *keyframe, vec![index as u8; 10 + index]))
+            .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]

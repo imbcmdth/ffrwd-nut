@@ -62,7 +62,9 @@ pub enum Media {
 pub struct Stream {
     /// The codec tag. `RGBA`, `I420`, the two pcm tags and the coded tags of
     /// [`CODED_VIDEO_FOURCCS`] and [`CODED_AUDIO_FOURCCS`] are what this
-    /// crate knows by name; any other tag is carried, not read.
+    /// crate knows by name. Any other tag of four printable ASCII bytes on a
+    /// video or audio stream is a coded stream named by its own text (see
+    /// [`Stream::coded_fourcc`]); anything else is carried, not read.
     pub fourcc: Vec<u8>,
     pub time_base: TimeBase,
     /// How many low bits of a PTS a frame may code, instead of all of it.
@@ -95,9 +97,11 @@ const PIX_FMT_FOURCCS: &[(&str, &[u8; 4])] = &[("rgba", b"RGBA"), ("yuv420p", b"
 /// `pcm_f32le` and `pcm_s16le`, both interleaved.
 const SAMPLE_FMT_FOURCCS: &[(&str, &[u8; 4])] = &[("f32", b"PFD\x20"), ("s16", b"PSD\x10")];
 
-/// The coded video streams this wire carries, and the tags ffmpeg gives each
-/// in NUT (its muxer writes the first; a demuxer accepts the aliases too).
-/// Payloads stay opaque: a packet is handed through exactly as it arrived.
+/// The coded video streams this wire knows by name, and the tags ffmpeg
+/// gives each in NUT (its muxer writes the first; a demuxer accepts the
+/// aliases too). Payloads stay opaque: a packet is handed through exactly as
+/// it arrived. A coded stream under a tag no table names is carried too, and
+/// named by the tag's own text; see [`Stream::coded_fourcc`].
 pub const CODED_VIDEO_FOURCCS: &[(&str, &[&[u8; 4]])] = &[
     ("h264", &[b"H264", b"h264", b"avc1", b"AVC1"]),
     ("hevc", &[b"HEVC", b"hevc", b"hev1", b"hvc1"]),
@@ -176,6 +180,57 @@ impl Stream {
         }
     }
 
+    /// A coded stream under a tag of the caller's own, for a codec no table
+    /// names: `PYRW`, say. The tag is written as given and read back as the
+    /// codec's name, so it must be exactly four printable ASCII bytes.
+    /// `kind` is `"video"` or `"audio"`, and `geometry` is what
+    /// [`video_geometry`](Stream::video_geometry) or
+    /// [`audio_geometry`](Stream::audio_geometry) hands back for that kind:
+    /// width and height, or rate and channel count. The time base, the
+    /// codec's out-of-band header and how far it reorders are the codec's
+    /// own, so they are taken as given too.
+    ///
+    /// A tag the tables name for `kind` builds that named stream, since it
+    /// is one. None for a tag that is not four printable ASCII bytes, one
+    /// this wire carries raw (`RGBA`, say), one the other kind's table
+    /// names, or a `kind` that names neither.
+    pub fn coded_fourcc(
+        kind: &str,
+        fourcc: &[u8],
+        geometry: (u32, u32),
+        time_base: TimeBase,
+        extradata: Vec<u8>,
+        decode_delay: u64,
+    ) -> Option<Stream> {
+        fourcc_text(fourcc)?;
+        let (first, second) = geometry;
+        let media = match kind {
+            "video" => Media::Video {
+                width: first,
+                height: second,
+                sample_width: 1,
+                sample_height: 1,
+                colorspace_type: 0,
+            },
+            "audio" => Media::Audio {
+                sample_rate: first,
+                channels: second,
+            },
+            _ => return None,
+        };
+        let stream = Stream {
+            fourcc: fourcc.to_vec(),
+            time_base,
+            msb_pts_shift: 14,
+            max_pts_distance: time_base.den.div_ceil(time_base.num.max(1)),
+            decode_delay,
+            extradata,
+            frame_rate: None,
+            media,
+        };
+        stream.codec_name().is_some().then_some(stream)
+    }
+
     /// Whether this is a data stream of JSON messages.
     pub fn is_json(&self) -> bool {
         self.media == (Media::Other { class: DATA_CLASS }) && self.fourcc == JSON_FOURCC
@@ -200,17 +255,23 @@ impl Stream {
 
     /// ffmpeg's name for the coded codec the tag names, from the table for
     /// this stream's own kind, or `json` for a data stream of JSON messages.
-    /// None for a raw stream and for any codec this wire does not carry.
-    pub fn codec_name(&self) -> Option<&'static str> {
-        let table = match self.media {
-            Media::Video { .. } => CODED_VIDEO_FOURCCS,
-            Media::Audio { .. } => CODED_AUDIO_FOURCCS,
+    /// A video or audio tag no table names is a coded stream all the same,
+    /// named by its own text (`PYRW`), when it is four printable ASCII bytes
+    /// and not a tag this wire carries raw. None for a raw stream, for a tag
+    /// the other kind's table names, and for any other tag.
+    pub fn codec_name(&self) -> Option<&str> {
+        let (table, other, raw) = match self.media {
+            Media::Video { .. } => (CODED_VIDEO_FOURCCS, CODED_AUDIO_FOURCCS, self.pix_fmt()),
+            Media::Audio { .. } => (CODED_AUDIO_FOURCCS, CODED_VIDEO_FOURCCS, self.sample_fmt()),
             Media::Other { .. } => return self.is_json().then_some("json"),
         };
-        table
-            .iter()
-            .find(|(_, tags)| tags.iter().any(|tag| self.fourcc == tag.as_slice()))
-            .map(|(name, _)| *name)
+        if let Some(name) = coded_name(table, &self.fourcc) {
+            return Some(name);
+        }
+        if raw.is_some() || coded_name(other, &self.fourcc).is_some() {
+            return None;
+        }
+        fourcc_text(&self.fourcc)
     }
 
     /// The sample format the codec tag names, or None for anything that is not
@@ -264,6 +325,23 @@ impl Stream {
             })
             .collect()
     }
+}
+
+/// The name a coded table gives a codec tag, among its aliases.
+fn coded_name(table: &[(&'static str, &[&[u8; 4]])], fourcc: &[u8]) -> Option<&'static str> {
+    table
+        .iter()
+        .find(|(_, tags)| tags.iter().any(|tag| fourcc == tag.as_slice()))
+        .map(|(name, _)| *name)
+}
+
+/// A codec tag as the text it spells, when it is exactly four printable
+/// ASCII bytes.
+fn fourcc_text(fourcc: &[u8]) -> Option<&str> {
+    if fourcc.len() != 4 || !fourcc.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return None;
+    }
+    std::str::from_utf8(fourcc).ok()
 }
 
 /// The name a table gives a codec tag.
