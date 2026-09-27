@@ -57,6 +57,19 @@ through a reorder buffer of `decode_delay + 1` entries. Hand them over
 in presentation order and the dts that come out the other end are
 wrong, which is the one mistake this interface cannot catch for you.
 
+## Raw formats
+
+Raw video rides as `rgba`, `yuv420p`, `yuv422p` or `yuv444p`, every
+plane 8 bits, and raw audio as interleaved `f32` or `s16`. Each goes
+under the tag ffmpeg's NUT muxer writes for it: `RGBA`, `I420`, `Y42B`
+and `444P` for the pictures, `PFD\x20` and `PSD\x10` for the samples.
+`Stream::video` and `Stream::audio` build a header from those names,
+and `pix_fmt()` and `sample_fmt()` read them back. A frame is its planes
+back to back, the bytes `-f rawvideo` writes; at an even width and
+height that is `w*h*4` for rgba, `w*h*3/2` for yuv420p, `w*h*2` for
+yuv422p and `w*h*3` for yuv444p. The wire carries whatever length a
+frame has, so checking it against the geometry is the consumer's job.
+
 ## Codecs with no name here
 
 h264, hevc, av1 and aac are known by name, under the tags ffmpeg gives
@@ -67,7 +80,7 @@ rate and the channel count), `write_coded` writes its packets, and a
 reader gets `codec_name() == Some("PYRW")` back. The tag has to be four
 printable ASCII bytes, since its text is the codec's name. A video or
 audio tag that no table names and this crate does not carry raw is read
-the same way, so a raw format this wire has no name for (`Y42B`, say)
+the same way, so a raw format this wire has no name for (`NV12`, say)
 reads as a coded stream of that name.
 
 ffmpeg has no decoder for such a tag and needs none to copy it. Its NUT

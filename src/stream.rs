@@ -60,11 +60,12 @@ pub enum Media {
 /// survives the hop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stream {
-    /// The codec tag. `RGBA`, `I420`, the two pcm tags and the coded tags of
-    /// [`CODED_VIDEO_FOURCCS`] and [`CODED_AUDIO_FOURCCS`] are what this
-    /// crate knows by name. Any other tag of four printable ASCII bytes on a
-    /// video or audio stream is a coded stream named by its own text (see
-    /// [`Stream::coded_fourcc`]); anything else is carried, not read.
+    /// The codec tag. `RGBA`, `I420`, `Y42B`, `444P`, the two pcm tags and
+    /// the coded tags of [`CODED_VIDEO_FOURCCS`] and [`CODED_AUDIO_FOURCCS`]
+    /// are what this crate knows by name. Any other tag of four printable
+    /// ASCII bytes on a video or audio stream is a coded stream named by its
+    /// own text (see [`Stream::coded_fourcc`]); anything else is carried, not
+    /// read.
     pub fourcc: Vec<u8>,
     pub time_base: TimeBase,
     /// How many low bits of a PTS a frame may code, instead of all of it.
@@ -90,8 +91,16 @@ pub struct Stream {
     pub media: Media,
 }
 
-/// The pixel formats this wire carries, and the codec tag ffmpeg gives each.
-const PIX_FMT_FOURCCS: &[(&str, &[u8; 4])] = &[("rgba", b"RGBA"), ("yuv420p", b"I420")];
+/// The pixel formats this wire carries, and the codec tag ffmpeg's NUT muxer
+/// writes for each: every plane 8 bits, the chroma planes of `yuv420p` half
+/// the luma's width and height, of `yuv422p` half its width, of `yuv444p` the
+/// same size.
+const PIX_FMT_FOURCCS: &[(&str, &[u8; 4])] = &[
+    ("rgba", b"RGBA"),
+    ("yuv420p", b"I420"),
+    ("yuv422p", b"Y42B"),
+    ("yuv444p", b"444P"),
+];
 
 /// The sample formats this wire carries, and the codec tag ffmpeg gives each:
 /// `pcm_f32le` and `pcm_s16le`, both interleaved.
@@ -121,7 +130,8 @@ pub const CODED_AUDIO_FOURCCS: &[(&str, &[&[u8; 4]])] =
 
 impl Stream {
     /// A video stream of `pix_fmt` frames, for building a header from nothing
-    /// but geometry.
+    /// but geometry. `pix_fmt` is one of [`supported_pix_fmts`]: `rgba`,
+    /// `yuv420p`, `yuv422p` or `yuv444p`. None for any other.
     pub fn video(pix_fmt: &str, width: u32, height: u32, time_base: TimeBase) -> Option<Stream> {
         Some(Stream {
             fourcc: fourcc_for_pix_fmt(pix_fmt)?.to_vec(),

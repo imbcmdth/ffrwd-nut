@@ -453,6 +453,110 @@ mod wire {
     }
 
     #[test]
+    fn yuv444p_and_yuv422p_use_the_tags_ffmpeg_writes() {
+        // What ffmpeg 9.0.1's NUT muxer wrote for `-c:v rawvideo -pix_fmt
+        // yuv444p` and `-pix_fmt yuv422p`, read off the stream headers.
+        assert_eq!(fourcc_for_pix_fmt("yuv444p"), Some(b"444P"));
+        assert_eq!(fourcc_for_pix_fmt("yuv422p"), Some(b"Y42B"));
+        assert_eq!(
+            supported_pix_fmts(),
+            ["rgba", "yuv420p", "yuv422p", "yuv444p"]
+        );
+    }
+
+    #[test]
+    fn a_yuv444p_stream_is_named_by_its_pixel_format() {
+        for (pix_fmt, fourcc) in [("yuv444p", b"444P"), ("yuv422p", b"Y42B")] {
+            let stream =
+                Stream::video(pix_fmt, 64, 48, TimeBase { num: 1, den: 30 }).expect("carried raw");
+            assert_eq!(stream.fourcc, fourcc);
+            assert_eq!(stream.pix_fmt(), Some(pix_fmt));
+            assert_eq!(stream.kind(), "video");
+            assert_eq!(stream.video_geometry(), Some((64, 48)));
+        }
+    }
+
+    #[test]
+    fn a_yuv444p_frame_is_three_whole_planes_and_round_trips() {
+        // 4:4:4 at 8 bits: luma and both chroma planes the picture's size,
+        // back to back. The wire carries whatever length it is handed; this
+        // pins that a frame of the size the format implies comes back whole.
+        let (width, height) = (6usize, 4usize);
+        let stream = Stream::video(
+            "yuv444p",
+            width as u32,
+            height as u32,
+            TimeBase { num: 1, den: 30 },
+        )
+        .expect("yuv444p is carried");
+        let frames: Vec<(i64, Vec<u8>)> = (0..3i64)
+            .map(|i| {
+                let plane = width * height;
+                let frame: Vec<u8> = (0..3 * plane).map(|b| (b as i64 + i) as u8).collect();
+                (i, frame)
+            })
+            .collect();
+        let back = round_trip(&stream, &frames);
+        assert_eq!(back, frames);
+        assert!(back
+            .iter()
+            .all(|(_, frame)| frame.len() == 3 * width * height));
+    }
+
+    #[test]
+    fn a_raw_tag_this_wire_now_carries_is_not_a_coded_stream() {
+        // `444P` and `Y42B` are four printable bytes, so before they were
+        // named here they read as coded streams of those names. Carried raw,
+        // they name no codec, build no coded stream and take no coded packet.
+        let tb = TimeBase { num: 1, den: 30 };
+        for (pix_fmt, fourcc) in [("yuv444p", b"444P"), ("yuv422p", b"Y42B")] {
+            let stream = Stream::video(pix_fmt, 8, 8, tb).expect("carried raw");
+            assert_eq!(stream.codec_name(), None, "{pix_fmt}");
+            assert_eq!(
+                Stream::coded_fourcc("video", fourcc, (8, 8), tb, Vec::new(), 0),
+                None,
+                "{pix_fmt} is carried raw"
+            );
+            let mut wire = Vec::new();
+            let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+            let packet = Packet {
+                pts: 0,
+                dts: None,
+                keyframe: true,
+            };
+            let err = muxer
+                .write_coded(&packet, &[0u8; 4])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("raw") && err.contains("write_frame"), "{err}");
+        }
+        // Under an audio stream the same tag is no pixel format, so it is a
+        // coded audio stream named by its text, as any unnamed tag is.
+        let mut audio = Stream::audio("s16", 48000, 2).expect("s16 is carried");
+        audio.fourcc = b"444P".to_vec();
+        assert_eq!(audio.codec_name(), Some("444P"));
+    }
+
+    #[test]
+    fn a_yuv444p_stream_that_claims_to_reorder_is_refused() {
+        // A decode delay is what only a coded stream may declare.
+        let mut stream = Stream::video("yuv444p", 8, 8, TimeBase { num: 1, den: 30 })
+            .expect("yuv444p is carried");
+        stream.decode_delay = 2;
+        let mut wire = Vec::new();
+        {
+            let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+            muxer.write_frame(0, &[0u8; 8 * 8 * 3]).expect("frame");
+            muxer.finish().expect("finish");
+        }
+        let err = refusal(&wire);
+        assert!(
+            err.contains("444P") && err.contains("decode delay 2"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn fourcc_for_coded_reads_the_muxers_own_tag() {
         assert_eq!(fourcc_for_coded("video", "h264"), Some(b"H264"));
         assert_eq!(fourcc_for_coded("video", "hevc"), Some(b"HEVC"));

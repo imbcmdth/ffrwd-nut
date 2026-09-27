@@ -477,6 +477,184 @@ fn a_codec_ffmpeg_has_no_name_for_crosses_its_nut_demuxer_and_muxer_untouched() 
     }
 }
 
+/// A frame's size in bytes at `width` by `height`.
+type FrameLen = fn(usize, usize) -> usize;
+
+/// The planar formats ffmpeg carries with every plane 8 bits, and each
+/// one's frame size: yuv444p's chroma planes are the picture's size,
+/// yuv422p's half its width.
+const PLANAR: &[(&str, FrameLen)] = &[
+    ("yuv444p", |width, height| width * height * 3),
+    ("yuv422p", |width, height| width * height * 2),
+];
+
+/// Three frames of `testsrc2` at 64x48 in `pix_fmt`, as ffmpeg muxes them
+/// into `format`, off its stdout.
+fn testsrc2_as(pix_fmt: &str, format: &str) -> Vec<u8> {
+    ffmpeg_stdout(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=30",
+            "-frames:v",
+            "3",
+            "-pix_fmt",
+            pix_fmt,
+            "-c:v",
+            "rawvideo",
+            "-f",
+            format,
+            "-",
+        ],
+        &[],
+    )
+}
+
+#[test]
+fn a_planar_raw_stream_ffmpeg_wrote_is_read_frame_for_frame() {
+    // yuv444p and yuv422p as ffmpeg's NUT muxer writes them: the tag it
+    // chose, the pixel format this crate names it, and every frame the same
+    // bytes ffmpeg writes to `-f rawvideo`.
+    if !ffmpeg_on_path() {
+        announce_skip("real ffmpeg cannot write a planar raw stream");
+        return;
+    }
+    for &(pix_fmt, frame_len) in PLANAR {
+        let raw = testsrc2_as(pix_fmt, "rawvideo");
+        let wire = testsrc2_as(pix_fmt, "nut");
+
+        let mut demuxer = Demuxer::open(&wire[..]).expect("read ffmpeg's NUT headers");
+        let stream = demuxer.stream();
+        assert_eq!(stream.pix_fmt(), Some(pix_fmt));
+        assert_eq!(stream.codec_name(), None, "{pix_fmt} is raw");
+        assert_eq!(stream.video_geometry(), Some((64, 48)));
+        let tb = stream.time_base;
+        let mut frames = Vec::new();
+        let mut buf = Vec::new();
+        while let Some(pts) = demuxer.read_frame(&mut buf).expect("read a frame") {
+            frames.push((pts, buf.clone()));
+        }
+        assert_eq!(frames.len(), 3, "{pix_fmt}");
+        for (index, (pts, frame)) in frames.iter().enumerate() {
+            // Frame `index` at 30 a second, in whichever time base ffmpeg
+            // chose.
+            assert_eq!(
+                i128::from(*pts) * i128::from(tb.num) * 30,
+                index as i128 * i128::from(tb.den),
+                "{pix_fmt} frame {index} pts {pts} in {tb:?}"
+            );
+            assert_eq!(
+                frame.len(),
+                frame_len(64, 48),
+                "{pix_fmt} frame {index} size"
+            );
+        }
+        let bytes: Vec<u8> = frames.into_iter().flat_map(|(_, frame)| frame).collect();
+        assert_eq!(
+            bytes, raw,
+            "{pix_fmt}: the frames are what ffmpeg writes to -f rawvideo"
+        );
+    }
+}
+
+#[test]
+fn a_planar_raw_stream_the_muxer_wrote_decodes_as_ffmpeg_decodes_it_raw() {
+    // The other way: frames of real picture content written here, read by
+    // ffmpeg's NUT demuxer and hashed frame by frame, against the same
+    // frames handed to ffmpeg as bare rawvideo with the format stated.
+    if !ffmpeg_on_path() {
+        announce_skip("real ffmpeg cannot decode a planar raw stream");
+        return;
+    }
+    for &(pix_fmt, frame_len) in PLANAR {
+        let raw = testsrc2_as(pix_fmt, "rawvideo");
+        let stream =
+            Stream::video(pix_fmt, 64, 48, TimeBase { num: 1, den: 30 }).expect("carried raw");
+        let mut wire = Vec::new();
+        {
+            let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+            for (index, frame) in raw.chunks(frame_len(64, 48)).enumerate() {
+                muxer.write_frame(index as i64, frame).expect("write frame");
+            }
+            muxer.finish().expect("finish");
+        }
+
+        let from_nut = frame_hashes(&ffmpeg_stdout(
+            &["-f", "nut", "-i", "-", "-f", "framemd5", "-"],
+            &wire,
+        ));
+        let from_raw = frame_hashes(&ffmpeg_stdout(
+            &[
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                pix_fmt,
+                "-video_size",
+                "64x48",
+                "-framerate",
+                "30",
+                "-i",
+                "-",
+                "-f",
+                "framemd5",
+                "-",
+            ],
+            &raw,
+        ));
+        assert_eq!(from_nut.len(), 3, "{pix_fmt}");
+        let size = frame_len(64, 48).to_string();
+        assert!(
+            from_nut.iter().all(|(decoded, _)| *decoded == size),
+            "{pix_fmt}: ffmpeg decoded frames of another size: {from_nut:?}"
+        );
+        assert_eq!(from_nut, from_raw, "{pix_fmt}");
+    }
+}
+
+/// Each frame's size and hash out of a framemd5 listing. The time base and
+/// timestamps are left out: a bare rawvideo input has its own.
+fn frame_hashes(framemd5: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(framemd5)
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            assert_eq!(fields.len(), 6, "a framemd5 line: {line}");
+            (fields[4].to_string(), fields[5].to_string())
+        })
+        .collect()
+}
+
+/// Runs ffmpeg over `args` with `input` on its stdin, failing with its own
+/// account of anything that went wrong, and hands back its stdout. The input
+/// is written from a thread of its own, so a pipe that fills on either side
+/// cannot stall the other.
+fn ffmpeg_stdout(args: &[&str], input: &[u8]) -> Vec<u8> {
+    let mut child = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffmpeg");
+    let mut stdin = child.stdin.take().expect("ffmpeg stdin");
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output().expect("wait for ffmpeg");
+    let written = writer.join().expect("the stdin writer");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ffmpeg {args:?} exited with {:?}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    assert!(stderr.is_empty(), "ffmpeg {args:?} complained:\n{stderr}");
+    written.expect("write ffmpeg's stdin");
+    output.stdout
+}
+
 /// Runs ffmpeg over `args`, failing with its own account of what went wrong.
 fn run_ffmpeg(args: &[&str]) {
     let output = Command::new("ffmpeg")
