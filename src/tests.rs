@@ -449,7 +449,7 @@ mod wire {
     fn yuv420p_uses_the_tag_ffmpeg_writes() {
         assert_eq!(fourcc_for_pix_fmt("yuv420p"), Some(b"I420"));
         assert_eq!(fourcc_for_pix_fmt("rgba"), Some(b"RGBA"));
-        assert_eq!(fourcc_for_pix_fmt("gray"), None);
+        assert_eq!(fourcc_for_pix_fmt("nv12"), None);
     }
 
     #[test]
@@ -458,9 +458,11 @@ mod wire {
         // yuv444p` and `-pix_fmt yuv422p`, read off the stream headers.
         assert_eq!(fourcc_for_pix_fmt("yuv444p"), Some(b"444P"));
         assert_eq!(fourcc_for_pix_fmt("yuv422p"), Some(b"Y42B"));
+        // And for `-pix_fmt gray`.
+        assert_eq!(fourcc_for_pix_fmt("gray"), Some(b"Y800"));
         assert_eq!(
             supported_pix_fmts(),
-            ["rgba", "yuv420p", "yuv422p", "yuv444p"]
+            ["rgba", "yuv420p", "yuv422p", "yuv444p", "gray"]
         );
     }
 

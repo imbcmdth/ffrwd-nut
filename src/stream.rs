@@ -94,12 +94,13 @@ pub struct Stream {
 /// The pixel formats this wire carries, and the codec tag ffmpeg's NUT muxer
 /// writes for each: every plane 8 bits, the chroma planes of `yuv420p` half
 /// the luma's width and height, of `yuv422p` half its width, of `yuv444p` the
-/// same size.
+/// same size. `gray` is the one plane.
 const PIX_FMT_FOURCCS: &[(&str, &[u8; 4])] = &[
     ("rgba", b"RGBA"),
     ("yuv420p", b"I420"),
     ("yuv422p", b"Y42B"),
     ("yuv444p", b"444P"),
+    ("gray", b"Y800"),
 ];
 
 /// The sample formats this wire carries, and the codec tag ffmpeg gives each:
@@ -131,7 +132,7 @@ pub const CODED_AUDIO_FOURCCS: &[(&str, &[&[u8; 4]])] =
 impl Stream {
     /// A video stream of `pix_fmt` frames, for building a header from nothing
     /// but geometry. `pix_fmt` is one of [`supported_pix_fmts`]: `rgba`,
-    /// `yuv420p`, `yuv422p` or `yuv444p`. None for any other.
+    /// `yuv420p`, `yuv422p`, `yuv444p` or `gray`. None for any other.
     pub fn video(pix_fmt: &str, width: u32, height: u32, time_base: TimeBase) -> Option<Stream> {
         Some(Stream {
             fourcc: fourcc_for_pix_fmt(pix_fmt)?.to_vec(),

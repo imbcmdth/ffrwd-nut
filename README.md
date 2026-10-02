@@ -65,16 +65,17 @@ writes exactly what `Muxer::new` writes.
 
 ## Raw formats
 
-Raw video rides as `rgba`, `yuv420p`, `yuv422p` or `yuv444p`, every
-plane 8 bits, and raw audio as interleaved `f32` or `s16`. Each goes
-under the tag ffmpeg's NUT muxer writes for it: `RGBA`, `I420`, `Y42B`
-and `444P` for the pictures, `PFD\x20` and `PSD\x10` for the samples.
-`Stream::video` and `Stream::audio` build a header from those names,
-and `pix_fmt()` and `sample_fmt()` read them back. A frame is its planes
-back to back, the bytes `-f rawvideo` writes; at an even width and
-height that is `w*h*4` for rgba, `w*h*3/2` for yuv420p, `w*h*2` for
-yuv422p and `w*h*3` for yuv444p. The wire carries whatever length a
-frame has, so checking it against the geometry is the consumer's job.
+Raw video rides as `rgba`, `yuv420p`, `yuv422p`, `yuv444p` or `gray`,
+every plane 8 bits, and raw audio as interleaved `f32` or `s16`. Each goes
+under the tag ffmpeg's NUT muxer writes for it: `RGBA`, `I420`, `Y42B`,
+`444P` and `Y800` for the pictures, `PFD\x20` and `PSD\x10` for the
+samples. `Stream::video` and `Stream::audio` build a header from those
+names, and `pix_fmt()` and `sample_fmt()` read them back. A frame is its
+planes back to back, the bytes `-f rawvideo` writes; at an even width
+and height that is `w*h*4` for rgba, `w*h*3/2` for yuv420p, `w*h*2` for
+yuv422p, `w*h*3` for yuv444p and `w*h` for gray. The wire carries
+whatever length a frame has, so checking it against the geometry is the
+consumer's job.
 
 ## Codecs with no name here
 

@@ -482,10 +482,11 @@ type FrameLen = fn(usize, usize) -> usize;
 
 /// The planar formats ffmpeg carries with every plane 8 bits, and each
 /// one's frame size: yuv444p's chroma planes are the picture's size,
-/// yuv422p's half its width.
+/// yuv422p's half its width, and gray has no chroma at all.
 const PLANAR: &[(&str, FrameLen)] = &[
     ("yuv444p", |width, height| width * height * 3),
     ("yuv422p", |width, height| width * height * 2),
+    ("gray", |width, height| width * height),
 ];
 
 /// Three frames of `testsrc2` at 64x48 in `pix_fmt`, as ffmpeg muxes them
@@ -513,7 +514,7 @@ fn testsrc2_as(pix_fmt: &str, format: &str) -> Vec<u8> {
 
 #[test]
 fn a_planar_raw_stream_ffmpeg_wrote_is_read_frame_for_frame() {
-    // yuv444p and yuv422p as ffmpeg's NUT muxer writes them: the tag it
+    // yuv444p, yuv422p and gray as ffmpeg's NUT muxer writes them: the tag it
     // chose, the pixel format this crate names it, and every frame the same
     // bytes ffmpeg writes to `-f rawvideo`.
     if !ffmpeg_on_path() {
