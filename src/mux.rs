@@ -8,9 +8,9 @@ use crate::bytes::{crc32, put_s, put_u32, put_u64, put_v, put_vb};
 use crate::error::Error;
 use crate::error::{bail, Result};
 use crate::SYNCPOINT_STARTCODE;
-use crate::{flags, Media, Packet, Stream};
+use crate::{flags, Media, Packet, Stream, TimeBase};
 #[cfg(feature = "annotations")]
-use crate::{ANNOTATION_CLASS, ANNOTATION_FOURCC, ANNOTATION_STREAM_ID, TRAILING_KEY};
+use crate::{ANNOTATION_CLASS, ANNOTATION_FOURCC, TRAILING_KEY};
 use crate::{FILE_ID, INFO_STARTCODE, MAIN_STARTCODE, MAX_DISTANCE, STREAM_STARTCODE, VERSION};
 
 /// The framecode every frame uses. It sets only `CODED`, so each frame states
@@ -38,16 +38,20 @@ const SIZE_MUL: u64 = 1;
 /// headers written here are tens of bytes, so it is a guard, not a case.
 const HEADER_CHECKSUM_THRESHOLD: usize = 4096;
 
-/// Writes one NUT stream: headers from a [`Stream`], then frames. With
-/// annotations on it writes a second stream beside the media one, for the
+/// Writes NUT: headers from one [`Stream`] or several, then frames. With
+/// annotations on it writes one more stream after the media ones, for the
 /// rows a module emitted; see the crate documentation for who may read it.
 pub struct Muxer<W> {
     out: W,
-    stream: Stream,
-    /// Whether the annotation stream was declared. Nothing reads it without
-    /// the feature that writes to it.
+    streams: Vec<Stream>,
+    /// The time bases the main header declares, each once, in the order the
+    /// streams first name them; and which of them each stream counts in.
+    time_bases: Vec<TimeBase>,
+    time_base_of: Vec<u64>,
+    /// The annotation stream's id, where it was declared. Nothing reads it
+    /// without the feature that writes to it.
     #[cfg_attr(not(feature = "annotations"), allow(dead_code))]
-    annotations: bool,
+    annotations: Option<u64>,
     pos: u64,
     last_syncpoint: Option<u64>,
 }
@@ -56,50 +60,85 @@ impl<W: Write> Muxer<W> {
     /// Writes the identifier and both headers and flushes them, so the reader
     /// on the far side knows the geometry before the first frame arrives.
     pub fn new(out: W, stream: &Stream) -> Result<Muxer<W>> {
-        Muxer::open(out, stream, false)
+        Muxer::open(out, std::slice::from_ref(stream), false)
     }
 
     /// `new`, plus the annotation stream. Only another ffrwd sidecar reads
     /// what this writes.
     #[cfg(feature = "annotations")]
     pub fn with_annotations(out: W, stream: &Stream) -> Result<Muxer<W>> {
-        Muxer::open(out, stream, true)
+        Muxer::open(out, std::slice::from_ref(stream), true)
     }
 
-    fn open(out: W, stream: &Stream, annotations: bool) -> Result<Muxer<W>> {
-        if stream.msb_pts_shift >= 63 {
-            bail!(
-                unsupported: "NUT output would shift PTS by {} bits",
-                stream.msb_pts_shift
-            );
+    /// Several streams on one wire, numbered in the order given: what one
+    /// edge carrying a picture, its sound and a data stream beside them is.
+    /// The frames of all of them interleave in the order they are written,
+    /// which a reader takes as the order to hand them on in.
+    pub fn with_streams(out: W, streams: &[Stream]) -> Result<Muxer<W>> {
+        Muxer::open(out, streams, false)
+    }
+
+    /// `with_streams`, plus the annotation stream after the last of them.
+    #[cfg(feature = "annotations")]
+    pub fn with_streams_annotated(out: W, streams: &[Stream]) -> Result<Muxer<W>> {
+        Muxer::open(out, streams, true)
+    }
+
+    fn open(out: W, streams: &[Stream], annotations: bool) -> Result<Muxer<W>> {
+        if streams.is_empty() {
+            bail!(unsupported: "NUT output with no stream to carry");
+        }
+        let mut time_bases: Vec<TimeBase> = Vec::new();
+        let mut time_base_of = Vec::with_capacity(streams.len());
+        for stream in streams {
+            if stream.msb_pts_shift >= 63 {
+                bail!(
+                    unsupported: "NUT output would shift PTS by {} bits",
+                    stream.msb_pts_shift
+                );
+            }
+            let index = match time_bases.iter().position(|tb| *tb == stream.time_base) {
+                Some(index) => index,
+                None => {
+                    time_bases.push(stream.time_base);
+                    time_bases.len() - 1
+                }
+            };
+            time_base_of.push(index as u64);
         }
         let mut muxer = Muxer {
             out,
-            stream: stream.clone(),
-            annotations,
+            streams: streams.to_vec(),
+            time_bases,
+            time_base_of,
+            annotations: annotations.then_some(streams.len() as u64),
             pos: 0,
             last_syncpoint: None,
         };
         muxer.write_bytes(FILE_ID)?;
-        let main = main_header(&muxer.stream, annotations);
+        let main = main_header(&muxer.time_bases, streams.len() + usize::from(annotations));
         muxer.write_packet(MAIN_STARTCODE, &main)?;
-        let header = stream_header(&muxer.stream);
-        muxer.write_packet(STREAM_STARTCODE, &header)?;
-        #[cfg(feature = "annotations")]
-        if annotations {
-            let header = annotation_stream_header(&muxer.stream);
+        for (id, stream) in streams.iter().enumerate() {
+            let header = stream_header(id as u64, muxer.time_base_of[id], stream);
             muxer.write_packet(STREAM_STARTCODE, &header)?;
         }
-        // The frame rate, where the stream carries one. NUT has no duration
+        #[cfg(feature = "annotations")]
+        if let Some(id) = muxer.annotations {
+            let header = annotation_stream_header(id, muxer.time_base_of[0], &muxer.streams[0]);
+            muxer.write_packet(STREAM_STARTCODE, &header)?;
+        }
+        // The frame rate, where a stream carries one. NUT has no duration
         // field, so this info packet is the only thing that tells a reader
         // how long a packet is shown for - and on a reordering stream it is
         // the only thing that CAN, since the next packet read is not the
         // next picture shown. It goes out with the headers, before the first
         // frame, because a reader that learns the rate later has already
         // handed out packets without it.
-        if let Some((num, den)) = muxer.stream.frame_rate {
-            let info = frame_rate_info(num, den);
-            muxer.write_packet(INFO_STARTCODE, &info)?;
+        for id in 0..muxer.streams.len() {
+            if let Some((num, den)) = muxer.streams[id].frame_rate {
+                let info = frame_rate_info(id as u64, num, den);
+                muxer.write_packet(INFO_STARTCODE, &info)?;
+            }
         }
         // A buffered writer would otherwise hold the headers until a
         // megabyte of frames pushed them out, and a reader waiting on them
@@ -108,22 +147,36 @@ impl<W: Write> Muxer<W> {
         Ok(muxer)
     }
 
-    /// The stream these headers describe.
+    /// The first stream these headers describe, which is the only one on a
+    /// wire opened with [`Muxer::new`].
     pub fn stream(&self) -> &Stream {
-        &self.stream
+        &self.streams[0]
+    }
+
+    /// Every stream these headers describe, in id order.
+    pub fn streams(&self) -> &[Stream] {
+        &self.streams
     }
 
     /// One frame, at `pts` in the stream's time base. Refused on an encoded
     /// stream: an encoded packet states its own keyframe flag, which
     /// `write_coded` carries and this fixed-flags path does not.
     pub fn write_frame(&mut self, pts: i64, data: &[u8]) -> Result<()> {
-        if self.stream.codec_name().is_some() {
+        self.write_frame_to(0, pts, data)
+    }
+
+    /// `write_frame`, onto stream `stream` of several.
+    pub fn write_frame_to(&mut self, stream: usize, pts: i64, data: &[u8]) -> Result<()> {
+        let Some(declared) = self.streams.get(stream) else {
+            bail!(unsupported: "NUT output has no stream {stream}");
+        };
+        if declared.codec_name().is_some() {
             bail!(
                 unsupported: "write_frame on an encoded {} stream; use write_coded",
-                self.stream.fourcc_name()
+                declared.fourcc_name()
             );
         }
-        self.write_packet_for(0, pts, FRAME_FLAGS, data)
+        self.write_packet_for(stream as u64, pts, FRAME_FLAGS, data)
     }
 
     /// One encoded packet, in the decode order it must be handed to this
@@ -140,14 +193,22 @@ impl<W: Write> Muxer<W> {
     /// the wire. Nothing here carries a duration: what NUT implies from the
     /// next packet's pts is all a reader gets back.
     pub fn write_coded(&mut self, packet: &Packet, data: &[u8]) -> Result<()> {
-        if self.stream.codec_name().is_none() {
+        self.write_coded_to(0, packet, data)
+    }
+
+    /// `write_coded`, onto stream `stream` of several.
+    pub fn write_coded_to(&mut self, stream: usize, packet: &Packet, data: &[u8]) -> Result<()> {
+        let Some(declared) = self.streams.get(stream) else {
+            bail!(unsupported: "NUT output has no stream {stream}");
+        };
+        if declared.codec_name().is_none() {
             bail!(
                 unsupported: "write_coded on a raw {} stream; use write_frame",
-                self.stream.fourcc_name()
+                declared.fourcc_name()
             );
         }
         let frame_flags = CODED_FRAME_FLAGS | if packet.keyframe { flags::KEY } else { 0 };
-        self.write_packet_for(0, packet.pts, frame_flags, data)
+        self.write_packet_for(stream as u64, packet.pts, frame_flags, data)
     }
 
     /// The rows a module produced for the frame at `pts`, as NDJSON, on the
@@ -156,18 +217,13 @@ impl<W: Write> Muxer<W> {
     /// frame arrives.
     #[cfg(feature = "annotations")]
     pub fn write_rows(&mut self, pts: i64, rows: &[String]) -> Result<()> {
-        if !self.annotations {
+        let Some(id) = self.annotations else {
             bail!(unsupported: "NUT output carries no annotation stream, so rows have nowhere to go");
-        }
+        };
         if rows.is_empty() {
             return Ok(());
         }
-        self.write_packet_for(
-            ANNOTATION_STREAM_ID,
-            pts,
-            FRAME_FLAGS,
-            rows.join("\n").as_bytes(),
-        )
+        self.write_packet_for(id, pts, FRAME_FLAGS, rows.join("\n").as_bytes())
     }
 
     /// The rows a module had no frame to put them on, as one record after
@@ -175,17 +231,17 @@ impl<W: Write> Muxer<W> {
     /// frame's timestamp.
     #[cfg(feature = "annotations")]
     pub fn write_trailing(&mut self, pts: i64, rows: &[String]) -> Result<()> {
-        if !self.annotations {
+        let Some(id) = self.annotations else {
             bail!(
                 unsupported: "NUT output carries no annotation stream, so trailing rows have \
                  nowhere to go"
             );
-        }
+        };
         if rows.is_empty() {
             return Ok(());
         }
         let record = trailing_record(rows)?;
-        self.write_packet_for(ANNOTATION_STREAM_ID, pts, FRAME_FLAGS, record.as_bytes())
+        self.write_packet_for(id, pts, FRAME_FLAGS, record.as_bytes())
     }
 
     /// One frame on `stream_id`, at `pts` in the stream's time base, stating
@@ -203,20 +259,27 @@ impl<W: Write> Muxer<W> {
         if pts < 0 {
             bail!(unsupported: "NUT output cannot carry the negative PTS {pts}");
         }
+        // The annotation stream counts in the first media stream's time base
+        // and codes its PTS the same way.
+        let media = if (stream_id as usize) < self.streams.len() {
+            stream_id as usize
+        } else {
+            0
+        };
         if self
             .last_syncpoint
             .is_none_or(|prev| self.pos - prev >= MAX_DISTANCE)
         {
-            self.write_syncpoint(pts)?;
+            self.write_syncpoint(pts, self.time_base_of[media])?;
         }
 
         // The whole PTS, offset past the range reserved for frames coding
         // only its low bits. Absolute means a frame never depends on how far
         // the reader has got, which is what keeps a filtered stream's
         // timestamps exactly the ones that came in.
-        let coded_pts = (pts as u64) + (1u64 << self.stream.msb_pts_shift);
-        // The framecode table's entry names stream 0, so only the annotation
-        // stream states an id of its own.
+        let coded_pts = (pts as u64) + (1u64 << self.streams[media].msb_pts_shift);
+        // The framecode table's entry names stream 0, so every other stream
+        // states its id itself.
         let frame_flags = if stream_id == 0 {
             frame_flags
         } else {
@@ -267,13 +330,14 @@ impl<W: Write> Muxer<W> {
     /// last one before it is this syncpoint itself; an encoded stream places
     /// one wherever `MAX_DISTANCE` is crossed regardless of which packet that
     /// lands on, since nothing on this wire ever demuxes by seeking to one.
-    fn write_syncpoint(&mut self, pts: i64) -> Result<()> {
+    fn write_syncpoint(&mut self, pts: i64, time_base: u64) -> Result<()> {
         let here = self.pos;
         let back_ptr = self.last_syncpoint.map_or(0, |prev| (here - prev) / 16);
         let mut body = Vec::with_capacity(8);
-        // One time base is declared, so its index adds nothing to the
-        // timestamp.
-        put_v(&mut body, pts as u64);
+        // The timestamp in one declared time base, as `ticks * count +
+        // index`; with one time base that is the ticks themselves.
+        let count = self.time_bases.len() as u64;
+        put_v(&mut body, (pts as u64).wrapping_mul(count) + time_base);
         put_v(&mut body, back_ptr);
         self.write_packet(SYNCPOINT_STARTCODE, &body)?;
         self.last_syncpoint = Some(here);
@@ -328,16 +392,18 @@ fn trailing_record(rows: &[String]) -> Result<String> {
     Ok(record)
 }
 
-/// The main header: the streams, one time base, and a framecode table with a
-/// single usable entry.
-fn main_header(stream: &Stream, annotations: bool) -> Vec<u8> {
+/// The main header: how many streams, the time bases they count in, and a
+/// framecode table with a single usable entry.
+fn main_header(time_bases: &[TimeBase], streams: usize) -> Vec<u8> {
     let mut body = Vec::with_capacity(64);
     put_v(&mut body, VERSION);
-    put_v(&mut body, if annotations { 2 } else { 1 }); // stream count
+    put_v(&mut body, streams as u64);
     put_v(&mut body, MAX_DISTANCE);
-    put_v(&mut body, 1); // time base count
-    put_v(&mut body, stream.time_base.num);
-    put_v(&mut body, stream.time_base.den);
+    put_v(&mut body, time_bases.len() as u64);
+    for time_base in time_bases {
+        put_v(&mut body, time_base.num);
+        put_v(&mut body, time_base.den);
+    }
 
     // Index 0, then index 1 - the one `EXPLICIT_FRAME_CODE` names - then
     // everything above it. A group's count leaves out index `N`, which is
@@ -363,13 +429,12 @@ fn put_frame_code_group(body: &mut Vec<u8>, code_flags: u64, size_mul: u64, coun
     put_v(body, count);
 }
 
-/// The info packet that states the stream's frame rate: one field named
+/// The info packet that states a stream's frame rate: one field named
 /// `r_frame_rate`, whose value is `num/den` as a UTF-8 string. It is written
-/// against the media stream rather than the file, since the rate is the
-/// stream's.
-fn frame_rate_info(num: u64, den: u64) -> Vec<u8> {
+/// against the stream rather than the file, since the rate is the stream's.
+fn frame_rate_info(stream_id: u64, num: u64, den: u64) -> Vec<u8> {
     let mut body = Vec::with_capacity(32);
-    put_v(&mut body, 1); // stream id plus one: stream 0
+    put_v(&mut body, stream_id + 1);
     put_s(&mut body, 0); // chapter id: the whole stream
     put_v(&mut body, 0); // chapter start
     put_v(&mut body, 0); // chapter length
@@ -382,12 +447,12 @@ fn frame_rate_info(num: u64, den: u64) -> Vec<u8> {
 
 /// The stream header: the codec tag, the geometry its class calls for, and
 /// how PTS are coded.
-fn stream_header(stream: &Stream) -> Vec<u8> {
+fn stream_header(id: u64, time_base: u64, stream: &Stream) -> Vec<u8> {
     let mut body = Vec::with_capacity(32);
-    put_v(&mut body, 0); // stream id
+    put_v(&mut body, id);
     put_v(&mut body, stream.class());
     put_vb(&mut body, &stream.fourcc);
-    put_v(&mut body, 0); // time base id
+    put_v(&mut body, time_base);
     put_v(&mut body, u64::from(stream.msb_pts_shift));
     put_v(&mut body, stream.max_pts_distance);
     put_v(&mut body, stream.decode_delay);
@@ -422,15 +487,16 @@ fn stream_header(stream: &Stream) -> Vec<u8> {
 }
 
 /// The annotation stream's header: the same time base and PTS coding as the
-/// media stream, so a row packet's timestamp compares directly with a
-/// frame's, and a data class, which carries no geometry.
+/// first media stream, so a row packet's timestamp compares directly with a
+/// frame's, and a data class, which carries no geometry. On a wire of one
+/// media stream its id is [`crate::ANNOTATION_STREAM_ID`].
 #[cfg(feature = "annotations")]
-fn annotation_stream_header(stream: &Stream) -> Vec<u8> {
+fn annotation_stream_header(id: u64, time_base: u64, stream: &Stream) -> Vec<u8> {
     let mut body = Vec::with_capacity(24);
-    put_v(&mut body, ANNOTATION_STREAM_ID);
+    put_v(&mut body, id);
     put_v(&mut body, ANNOTATION_CLASS);
     put_vb(&mut body, ANNOTATION_FOURCC);
-    put_v(&mut body, 0); // time base id: the media stream's
+    put_v(&mut body, time_base);
     put_v(&mut body, u64::from(stream.msb_pts_shift));
     put_v(&mut body, stream.max_pts_distance);
     put_v(&mut body, 0); // decode delay

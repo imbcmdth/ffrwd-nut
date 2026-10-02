@@ -57,6 +57,12 @@ through a reorder buffer of `decode_delay + 1` entries. Hand them over
 in presentation order and the dts that come out the other end are
 wrong, which is the one mistake this interface cannot catch for you.
 
+`Muxer::with_streams` puts several streams on one wire, a picture, its
+sound and a data stream say, each in its own time base, and
+`write_frame_to` or `write_coded_to` names which one a frame belongs to.
+Frames interleave in the order they are written. With one stream it
+writes exactly what `Muxer::new` writes.
+
 ## Raw formats
 
 Raw video rides as `rgba`, `yuv420p`, `yuv422p` or `yuv444p`, every

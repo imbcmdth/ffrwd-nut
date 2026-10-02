@@ -46,9 +46,10 @@
 //! # The annotation stream
 //!
 //! A sidecar that emits rows can put them on the wire beside the frames, so
-//! the next sidecar reads both from one pipe. That is stream 1: codec tag
-//! [`ANNOTATION_FOURCC`], stream class [`ANNOTATION_CLASS`], the media
-//! stream's time base, one packet per frame that has rows, its payload the
+//! the next sidecar reads both from one pipe. That is the stream after the
+//! last media one, which on a wire of one media stream is stream 1: codec
+//! tag [`ANNOTATION_FOURCC`], stream class [`ANNOTATION_CLASS`], the first
+//! media stream's time base, one packet per frame that has rows, its payload the
 //! rows as NDJSON and its PTS the frame's. A frame with no rows gets no
 //! packet, and the packet is written before the frame it belongs to.
 //!
@@ -97,7 +98,8 @@ pub const VERSION: u64 = 3;
 pub const MAX_DISTANCE: u64 = 32767;
 
 /// The stream the annotation packets ride on, beside the media stream's
-/// stream 0.
+/// stream 0, on a wire of one media stream. With several it follows the
+/// last of them.
 pub const ANNOTATION_STREAM_ID: u64 = 1;
 
 /// NUT's stream class for data that is neither video, audio nor subtitles.
